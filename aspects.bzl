@@ -27,17 +27,13 @@ load(
     "@bazel_tools//tools/build_defs/cc:action_names.bzl",
     "CPP_COMPILE_ACTION_NAME",
     "C_COMPILE_ACTION_NAME",
-    "OBJCPP_COMPILE_ACTION_NAME",
-    "OBJC_COMPILE_ACTION_NAME",
 )
 
-CompilationAspect = provider()
-
-_cpp_extensions = [
-    "cc",
-    "cpp",
-    "cxx",
-]
+CompilationDbAspect = provider(
+    fields = {
+        "compilation_db": "depset of json objects of compilation commands",
+    }
+)
 
 _cc_rules = [
     "cc_library",
@@ -54,21 +50,59 @@ _objc_rules = [
 
 _all_rules = _cc_rules + _objc_rules
 
+def _get_action_name(feature_configuration):
+    for action_name in [
+        CPP_COMPILE_ACTION_NAME,
+        C_COMPILE_ACTION_NAME,
+    ]:
+        if cc_common.action_is_enabled(
+            feature_configuration = feature_configuration,
+            action_name = action_name
+        ):
+            return action_name
+    return None
+
+def _get_command_line(target, ctx, src, cc_toolchain):
+    feature_configuration = cc_common.configure_features(
+        ctx = ctx,
+        cc_toolchain = cc_toolchain,
+        requested_features = ctx.features,
+        unsupported_features = ctx.disabled_features,
+    )
+    action_name = _get_action_name(feature_configuration)
+    if not action_name:
+        return None
+    compiler = cc_common.get_tool_for_action(
+        feature_configuration = feature_configuration,
+        action_name = action_name,
+    )
+    compilation_context = target[CcInfo].compilation_context
+    compile_variables = cc_common.create_compile_variables(
+        feature_configuration = feature_configuration,
+        cc_toolchain = cc_toolchain,
+        source_file = src.path,
+        user_compile_flags = ctx.fragments.cpp.cxxopts +
+                                ctx.fragments.cpp.copts,
+        include_directories = compilation_context.includes,
+        quote_include_directories = compilation_context.quote_includes,
+        system_include_directories = compilation_context.system_includes,
+        framework_include_directories = compilation_context.framework_includes,
+        preprocessor_defines = compilation_context.defines,
+    )
+    compiler_options = cc_common.get_memory_inefficient_command_line(
+        feature_configuration = feature_configuration,
+        action_name = action_name,
+        variables = compile_variables,
+    )
+    return "\"{}\" {}".format(compiler, ' '.join(compiler_options))
+
+
 def _compilation_db_json(compilation_db):
     # Return a JSON string for the compilation db entries.
 
     entries = [entry.to_json() for entry in compilation_db]
     return ",\n ".join(entries)
 
-def _is_cpp_target(srcs):
-    return any([src.extension in _cpp_extensions for src in srcs])
-
-def _is_objcpp_target(srcs):
-    for src in srcs:
-        if src.extension == "mm":
-            return True
-
-    return False
 
 def _sources(target, ctx):
     srcs = []
@@ -82,230 +116,46 @@ def _sources(target, ctx):
 
     return srcs
 
-# Function copied from https://gist.github.com/oquenchil/7e2c2bd761aa1341b458cc25608da50c
-def get_compile_flags(dep):
-    options = []
-    compilation_context = dep[CcInfo].compilation_context
-    for define in compilation_context.defines.to_list():
-        options.append("-D{}".format(define))
-
-    for system_include in compilation_context.system_includes.to_list():
-        if len(system_include) == 0:
-            system_include = "."
-        options.append("-isystem {}".format(system_include))
-
-    for include in compilation_context.includes.to_list():
-        if len(include) == 0:
-            include = "."
-        options.append("-I {}".format(include))
-
-    for quote_include in compilation_context.quote_includes.to_list():
-        if len(quote_include) == 0:
-            quote_include = "."
-        options.append("-iquote {}".format(quote_include))
-
-    return options
-
-def _cc_compiler_info(ctx, target, srcs, feature_configuration, cc_toolchain):
-    compile_variables = None
-    compiler_options = None
-    compiler = None
-    compile_flags = None
-    force_language_mode_option = ""
-
-    # This is useful for compiling .h headers as C++ code.
-    if _is_cpp_target(srcs):
-        compile_variables = cc_common.create_compile_variables(
-            feature_configuration = feature_configuration,
-            cc_toolchain = cc_toolchain,
-            user_compile_flags = ctx.fragments.cpp.cxxopts +
-                                 ctx.fragments.cpp.copts,
-            add_legacy_cxx_options = True,
-        )
-        compiler_options = cc_common.get_memory_inefficient_command_line(
-            feature_configuration = feature_configuration,
-            action_name = CPP_COMPILE_ACTION_NAME,
-            variables = compile_variables,
-        )
-        force_language_mode_option = " -x c++"
-    else:
-        compile_variables = cc_common.create_compile_variables(
-            feature_configuration = feature_configuration,
-            cc_toolchain = cc_toolchain,
-            user_compile_flags = ctx.fragments.cpp.copts,
-        )
-        compiler_options = cc_common.get_memory_inefficient_command_line(
-            feature_configuration = feature_configuration,
-            action_name = C_COMPILE_ACTION_NAME,
-            variables = compile_variables,
-        )
-
-    compiler = str(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = C_COMPILE_ACTION_NAME,
-        ),
-    )
-
-    compile_flags = (compiler_options +
-                     get_compile_flags(target) +
-                     (ctx.rule.attr.copts if "copts" in dir(ctx.rule.attr) else []))
-
-    return struct(
-        compile_variables = compile_variables,
-        compiler_options = compiler_options,
-        compiler = compiler,
-        compile_flags = compile_flags,
-        force_language_mode_option = force_language_mode_option,
-    )
-
-def _objc_compiler_info(ctx, target, srcs, feature_configuration, cc_toolchain):
-    compile_variables = None
-    compiler_options = None
-    compiler = None
-    compile_flags = None
-    force_language_mode_option = ""
-
-    # This is useful for compiling .h headers as C++ code.
-    if _is_objcpp_target(srcs):
-        compile_variables = cc_common.create_compile_variables(
-            feature_configuration = feature_configuration,
-            cc_toolchain = cc_toolchain,
-            user_compile_flags = ctx.fragments.objc.copts,
-            add_legacy_cxx_options = True,
-        )
-        compiler_options = cc_common.get_memory_inefficient_command_line(
-            feature_configuration = feature_configuration,
-            action_name = OBJCPP_COMPILE_ACTION_NAME,
-            variables = compile_variables,
-        )
-        force_language_mode_option = " -x objective-c++"
-    else:
-        compile_variables = cc_common.create_compile_variables(
-            feature_configuration = feature_configuration,
-            cc_toolchain = cc_toolchain,
-            user_compile_flags = ctx.fragments.objc.copts,
-        )
-        compiler_options = cc_common.get_memory_inefficient_command_line(
-            feature_configuration = feature_configuration,
-            action_name = OBJC_COMPILE_ACTION_NAME,
-            variables = compile_variables,
-        )
-        force_language_mode_option = " -x objective-c"
-
-    compiler = str(
-        cc_common.get_tool_for_action(
-            feature_configuration = feature_configuration,
-            action_name = OBJC_COMPILE_ACTION_NAME,
-        ),
-    )
-
-    defines = ["-D{}".format(val) for val in target.objc.define]
-    includes = ["-I{}".format(val) for val in target.objc.include]
-    system_includes = ["-isystem {}".format(val) for val in target.objc.include_system]
-    iquotes = ["-iquote {}".format(val) for val in target.objc.iquote]
-    frameworks = (["-F {}/..".format(val) for val in target.objc.framework_dir] +
-                  ["-F {}/..".format(val) for val in target.objc.dynamic_framework_dir] +
-                  ["-F {}/..".format(val) for val in target.objc.framework_search_path_only])
-
-    xcode_config = ctx.attr._xcode_config[apple_common.XcodeVersionConfig]
-
-    sdk_version = xcode_config.sdk_version_for_platform(ctx.fragments.apple.single_arch_platform)
-    apple_env = apple_common.target_apple_env(xcode_config, ctx.fragments.apple.single_arch_platform)
-    sdk_platform = apple_env["APPLE_SDK_PLATFORM"]
-
-    # FIXME is there any way of getting the SDKROOT value here? The only thing that seems to know about it is
-    # XcodeLocalEnvProvider, but I can't seem to find a way to access that
-    platform_root = "/Applications/Xcode.app/Contents/Developer/Platforms/{platform}.platform".format(platform = sdk_platform)
-    sdk_root = "/Applications/Xcode.app/Contents/Developer/Platforms/{platform}.platform/Developer/SDKs/{platform}{version}.sdk".format(platform = sdk_platform, version = sdk_version)
-
-    compile_flags = (compiler_options +
-                     ["-isysroot {}".format(sdk_root)] +
-                     ["-F {}/System/Library/Frameworks".format(sdk_root)] +
-                     ["-F {}/Developer/Library/Frameworks".format(platform_root)] +
-                     # FIXME this needs to be done per-file to be fully correct
-                     ["-fobjc-arc"] +
-                     defines +
-                     includes +
-                     iquotes +
-                     system_includes +
-                     frameworks +
-                     (ctx.rule.attr.copts if "copts" in dir(ctx.rule.attr) else []))
-
-    return struct(
-        compile_variables = compile_variables,
-        compiler_options = compiler_options,
-        compiler = compiler,
-        compile_flags = compile_flags,
-        force_language_mode_option = force_language_mode_option,
-    )
-
 def _compilation_database_aspect_impl(target, ctx):
-    # Write the compile commands for this target to a file, and return
-    # the commands for the transitive closure.
+    """Write the compile commands for this target to a file, and return the commands for the transitive closure."""
 
     # We support only these rule kinds.
     if ctx.rule.kind not in _all_rules:
+        return []
+    if ctx.label.workspace_name:
         return []
 
     compilation_db = []
 
     cc_toolchain = find_cpp_toolchain(ctx)
-    feature_configuration = cc_common.configure_features(
-        ctx = ctx,
-        cc_toolchain = cc_toolchain,
-        requested_features = ctx.features,
-        unsupported_features = ctx.disabled_features,
-    )
-
     srcs = _sources(target, ctx)
-
-    compiler_info = None
-
-    if ctx.rule.kind in _cc_rules:
-        compiler_info = _cc_compiler_info(ctx, target, srcs, feature_configuration, cc_toolchain)
-    else:
-        compiler_info = _objc_compiler_info(ctx, target, srcs, feature_configuration, cc_toolchain)
-
-    compile_flags = compiler_info.compile_flags
-    compile_flags += [
-        # Use -I to indicate that we want to keep the normal position in the system include chain.
-        # See https://github.com/grailbio/bazel-compilation-database/issues/36#issuecomment-531971361.
-        "-I " + str(d)
-        for d in cc_toolchain.built_in_include_directories
-    ]
-    compile_command = compiler_info.compiler + " " + " ".join(compile_flags) + compiler_info.force_language_mode_option
-
     for src in srcs:
-        command_for_file = compile_command + " -c " + src.path
-
-        exec_root_marker = "__EXEC_ROOT__"
-        compilation_db.append(
-            struct(command = command_for_file, directory = exec_root_marker, file = src.path),
+        command_line = _get_command_line(
+            target = target,
+            ctx = ctx,
+            src = src,
+            cc_toolchain = cc_toolchain,
         )
-
-    # Write the commands for this target.
-    compdb_file = ctx.actions.declare_file(ctx.label.name + ".compile_commands.json")
-    ctx.actions.write(
-        content = _compilation_db_json(compilation_db),
-        output = compdb_file,
-    )
-
-    # Collect all transitive dependencies.
-    transitive_compilation_db = []
-    all_compdb_files = []
-    for dep in ctx.rule.attr.deps:
-        if CompilationAspect not in dep:
-            continue
-        transitive_compilation_db.append(dep[CompilationAspect].compilation_db)
-        all_compdb_files.append(dep[OutputGroupInfo].compdb_files)
-
-    compilation_db = depset(compilation_db, transitive = transitive_compilation_db)
-    all_compdb_files = depset([compdb_file], transitive = all_compdb_files)
-
+        if command_line:
+            compilation_db.append(
+                struct(
+                    command = command_line,
+                    directory = "__BAZEL_EXECUTION_ROOT__",
+                    file = "__BAZEL_WORKSPACE__/" + src.path,
+                )
+            )
+        
     return [
-        CompilationAspect(compilation_db = compilation_db),
-        OutputGroupInfo(compdb_files = all_compdb_files),
+        CompilationDbAspect(
+            compilation_db = depset(
+                direct = compilation_db,
+                transitive = [
+                    dep[CompilationDbAspect].compilation_db
+                    for dep in ctx.rule.attr.deps
+                    if CompilationDbAspect in dep
+                ]
+            )
+        )
     ]
 
 compilation_database_aspect = aspect(
@@ -314,10 +164,9 @@ compilation_database_aspect = aspect(
         "_cc_toolchain": attr.label(
             default = Label("@bazel_tools//tools/cpp:current_cc_toolchain"),
         ),
-        "_xcode_config": attr.label(default = Label("@bazel_tools//tools/osx:current_xcode_config")),
     },
-    fragments = ["cpp", "objc", "apple"],
-    required_aspect_providers = [CompilationAspect],
+    fragments = ["cpp"],
+    required_aspect_providers = [CcInfo],
     toolchains = ["@bazel_tools//tools/cpp:toolchain_type"],
     implementation = _compilation_database_aspect_impl,
 )
@@ -326,28 +175,14 @@ def _compilation_database_impl(ctx):
     # Generates a single compile_commands.json file with the
     # transitive depset of specified targets.
 
-    if ctx.attr.disable:
-        ctx.actions.write(output = ctx.outputs.filename, content = "[]\n")
-        return
-
-    # We make this rule a no-op on Windows because it is not supported.
-    # We use the exposed host path separator as a hack to detect Windows.
-    # The ideal solution here would be to use toolchains.
-    # https://github.com/bazelbuild/bazel/issues/2045
-    if ctx.configuration.host_path_separator != ":":
-        print("Windows is not supported in compilation_database rule")
-        ctx.actions.write(output = ctx.outputs.filename, content = "[]\n")
-        return
-
     compilation_db = []
     for target in ctx.attr.targets:
-        compilation_db.append(target[CompilationAspect].compilation_db)
+        compilation_db.append(target[CompilationDbAspect].compilation_db)
 
     compilation_db = depset(transitive = compilation_db)
 
     content = "[\n" + _compilation_db_json(compilation_db.to_list()) + "\n]\n"
-    content = content.replace("__EXEC_ROOT__", ctx.attr.exec_root)
-    content = content.replace("-isysroot __BAZEL_XCODE_SDKROOT__", "")
+    # content = content.replace("-isysroot __BAZEL_XCODE_SDKROOT__", "")
     ctx.actions.write(output = ctx.outputs.filename, content = content)
 
 compilation_database = rule(
@@ -355,17 +190,6 @@ compilation_database = rule(
         "targets": attr.label_list(
             aspects = [compilation_database_aspect],
             doc = "List of all cc targets which should be included.",
-        ),
-        "exec_root": attr.string(
-            default = "__EXEC_ROOT__",
-            doc = "Execution root of Bazel as returned by 'bazel info execution_root'.",
-        ),
-        "disable": attr.bool(
-            default = False,
-            doc = ("Makes this operation a no-op; useful in combination with a 'select' " +
-                   "for platforms where the internals of this rule are not properly " +
-                   "supported. For known unsupported platforms (e.g. Windows), the " +
-                   "rule is always a no-op."),
         ),
     },
     outputs = {
